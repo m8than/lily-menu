@@ -1,0 +1,77 @@
+name: Release
+
+# Push a tag matching VERSION (e.g. v1.0.0) to build, test and publish
+# LilyMenu-<version>.zip. Without the signing secrets below the app is
+# ad-hoc signed; with them it is Developer ID signed and notarized.
+#
+#   MACOS_CERTIFICATE           base64 of a Developer ID Application .p12
+#   MACOS_CERTIFICATE_PASSWORD  its password
+#   CODESIGN_IDENTITY           e.g. "Developer ID Application: Name (TEAMID)"
+#   NOTARY_APPLE_ID, NOTARY_TEAM_ID, NOTARY_PASSWORD (app-specific password)
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      HAS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE != '' }}
+      HAS_NOTARY: ${{ secrets.NOTARY_APPLE_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag matches VERSION
+        run: test "v$(tr -d '[:space:]' < VERSION)" = "$GITHUB_REF_NAME"
+
+      - run: swift test
+
+      - name: Import the signing certificate
+        if: env.HAS_CERTIFICATE == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(uuidgen)
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/certificate.p12"
+
+      - name: Store notarization credentials
+        if: env.HAS_CERTIFICATE == 'true' && env.HAS_NOTARY == 'true'
+        run: |
+          xcrun notarytool store-credentials lilymenu \
+            --apple-id "${{ secrets.NOTARY_APPLE_ID }}" \
+            --team-id "${{ secrets.NOTARY_TEAM_ID }}" \
+            --password "${{ secrets.NOTARY_PASSWORD }}"
+          echo "NOTARY_PROFILE=lilymenu" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          CODESIGN_IDENTITY: ${{ env.HAS_CERTIFICATE == 'true' && secrets.CODESIGN_IDENTITY || '-' }}
+        run: scripts/bundle.sh --zip
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" dist/LilyMenu-*.zip dist/LilyMenu-*.zip.sha256 \
+            --title "LilyMenu $version" --notes-file "$RUNNER_TEMP/notes.md"
